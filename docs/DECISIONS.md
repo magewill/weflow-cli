@@ -510,6 +510,35 @@ is asking it to generate more prose, which is the failure this whole line of wor
 avoid. When the articles predate the probability fields, the section says so explicitly: an
 absent section must not be readable as "everything here was certain".
 
+**Measured prevalence, which is what the threshold actually trades against.** Over a
+topic-balanced 160-article candidate pool: **86.1%** of articles score below 0.2 on
+`includeScore`, 4.4% in 0.20-0.35, 0.6% in 0.35-0.50, and **8.9% at or above 0.50** (3.8% +
+1.9% + 3.2%). So the 0.5 threshold admits roughly one article in eleven of a balanced mix -
+and the real daily mix is 新闻-heavy, which scores low, so the true figure is likely lower.
+An earlier guess in this document ("about 3%") was not derived from anything; this one is.
+The sampler also had to change to produce a usable curve: sampling by topic alone yielded a
+50-article sample in which 45 items sat below 0.2, so labelling 50 bought the information of
+labelling 4. It now draws from a larger scored pool, stratified **by probability band**, which
+put 22 of 50 in the bands that matter - and reports the pool's band shares separately, because
+a band-stratified sample is not a natural distribution and must not be read as one.
+
+**How the "no gold standard" gap finally gets closed.** `scripts/quality_eval.py sample`
+draws a stratified sample and scores each article through the **production** path at sample
+time, then writes blank `topic` / `include` fields for a person to fill in; `score` prints
+topic agreement (for Jev *and* for the stored labels), a calibration table by probability
+bucket, and a threshold sweep naming the cut point that best matches the human. Two design
+points are load-bearing:
+
+- **The sample is re-scored instead of reusing stored values.** No real artifact on disk
+  carries `includeScore` - the six files in the 2026-09-05 output directory were written by a
+  run of the code from *before* that field existed, so they have `relevanceScore` and
+  `topicConfidence` only. And the stored `topic` is the very thing under test: it labelled 364
+  articles as 学术 in one day. So the (probability, human label) pairs have to be produced
+  fresh, which also means the corpus never has to be re-run and `output/` is only read.
+- **A blank label is "not sure", not "wrong".** Items left `null` are excluded from every
+  number rather than counted as misses, because collapsing the two would make accuracy look
+  worse the more honest the labeller is.
+
 **A field written on one path and not the other is a field that does not exist.** The three
 probability fields were added to the markdown frontmatter but not to `.articles.json`, and the
 report loader prefers the JSON. The new section therefore worked in the fallback path and was
@@ -560,7 +589,11 @@ caller hands it.
 **Reason:** the value is not that this judges better than the caller's own model; it is that a
 batch of judgements becomes affordable. Measured: ~1s for a request regardless of whether it
 carries 2 questions or 12, since `state` dominates the token count, and 20 candidates cost
-around two ten-thousandths of a cent more than 1. So "label 200 items across six dimensions"
+around two ten-thousandths of a cent more than 1. **That ~1s is an idle-service figure.** It is
+independent of state size (200 characters and 4000 characters both measured ~1.1s), but not of
+concurrency: a 158-article pass at 6 workers averaged **5.7s per call**, with a 10.1s outlier.
+The cost model is still what makes batch judging viable - it just means wall-clock for a large
+batch should be estimated at seconds per call, not at one. So "label 200 items across six dimensions"
 stops being a token-budget decision. Two further properties come from it being non-generative:
 the answers arrive **typed with probabilities** rather than as prose to be parsed, and nothing
 is being *written*, so it is safe to place inside control flow where generated text would be
