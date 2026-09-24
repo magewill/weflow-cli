@@ -527,7 +527,71 @@ weflow-cli assistant start
 weflow-cli assistant status
 ```
 
+### 助手能读到多少：隐私三档，以及本地引擎这个例外
+
+| `assistantPrivacy` | 工具拿到的聊天正文 | 出境 |
+| --- | --- | --- |
+| `strict`（默认） | 换成 `[内容N字已按严格模式屏蔽]` | 不出 |
+| `balanced` | **原文**，但电话/证件/邮箱/密钥/链接被打成 `[电话]` 这类占位 | 出（到当前模型） |
+| `open` | 原文，什么都不打 | 出 |
+
+**换本地引擎时严格模式的屏蔽会自动让路**：`aiEngine=ollama` 或 `lmstudio` 时数据不出机器，
+`maskMessageBodyText` 直接返回原文，不需要动 `assistantPrivacy`。所以"我想让它读得到聊天内容，
+但又不想把内容发出去"的正解是**换引擎**，不是降档——降档等于把原文交给第三方。
+
+```powershell
+weflow-cli config set assistantPrivacy balanced   # 降档（正文会出境，PII 打码）
+weflow-cli config set aiEngine ollama             # 或换本地引擎（内容不出机器）
+```
+
+在微信里发「**隐私**」可以随时问出当前档位、工具实际拿到的是原文还是被屏蔽、以及该执行哪条命令
+（它只报不改——**不让一条微信消息能改隐私档位**，那等于把隐私开关搬进对话里）。
+
+**改完必须重启助手**：配置是**启动时**读进进程内存的（`configService.get` 不回读磁盘），
+所以对一个正在跑的助手，外部 `config set` 不生效——`assistant stop` 再 `assistant start`。
+
 助手默认拒绝所有发送者，需明确设置 `assistantWhitelist`。群聊还需要群白名单、成员白名单和 @ 门槛；项目不通过客户端自动化或非官方协议拉群。
+
+**第一次启用**：扫码一次，剩下的它会告诉你。
+
+1. `weflow-cli login-wechat` —— 扫码登录消息通道（这一步只能人来做：iLink 只有扫码这一条官方登录路）；
+2. `weflow-cli assistant start`；
+3. 从你的微信给机器人发一条消息。**助手会拒绝它**（白名单为空 = 拒绝所有人），但日志里会出现一行
+   `[首次配置]`，带着**你自己的发送者 ID** 和该执行的那条 `config set assistantWhitelist` ——
+   照抄执行即可。之后它就开始回话了。
+
+为什么不让登录自己把白名单写好：登录响应给的是 `ilink_user_id`，而白名单要的是入站消息里的
+`from_user_id`（文档里写成 `@im.wechat ID`），**这两者是不是同一个值这个仓库里没有任何东西验证过**。
+猜错的后果是"白名单非空、看着配好了、却仍然拒你"，而且提示也不会再出现（白名单已经不空了）——
+所以这里宁可多一次复制粘贴。真值在第 3 步那条消息里，它自己会来。
+
+想让助手先"只看不答"式地跑一段（记下它本来会怎么走，行为不改）：`config set assistantFastRoute log`。
+
+**启动前先确认两件事**，否则 `assistant start` 会如实地告诉你它起不来：
+
+1. **消息通道要已登录**（`weflow-cli login-wechat`）。没登录时子进程会退出，启动命令会把
+   退出码和日志尾部原样报出来：`子进程启动后立即退出 (code 1)；日志尾部: Error: 未登录消息通道…`。
+   这句话出现在终端里就说明机制是对的，**问题在通道，不在守护进程**。
+2. **改了源码要先 `npm run build`**。守护进程优先运行 `dist/bin/weflow-cli.js`，只要这个文件
+   存在就不会用 `bin/weflow-cli.ts`；不重建，守护进程跑的还是旧的编译产物。
+
+助手还有一个**默认关闭**的单轮快路径（D-035）：先用本机判断层问一次"这条要不要查本机数据、
+查哪一项"，把那个工具先跑掉，于是模型第一轮就看得到结果（两次往返变一次）。
+
+```powershell
+weflow-cli config set assistantFastRoute log   # 灰度：只记"本来会走哪条"，行为一个字不改
+weflow-cli config set assistantFastRoute on    # 打开
+weflow-cli config set assistantFastRoute off   # 关（默认）
+```
+
+灰度期看两个地方：`assistant log` 里的 `[快路径/只记] 路由到 X（...）`，以及
+`~/.weflow-cli/assistant_audit.log` 里的 `FASTROUTE_WOULD` / `FASTROUTE_SKIP`（回退时那行会写
+明原因：不需要查本机数据、置信度不足、能力名不认识…）。只有参数是固定集合的工具会被路由；
+像"总结一下我和某某的聊天"这种要点名某个人的，一律回退到原来的循环——这是刻意的，硬凑参数
+会让模型拿着不相关的结果自信作答。
+
+启动失败时**不会**留下 pid 文件 —— 写 pid 就等于对外宣称它在运行。排查用
+`weflow-cli assistant status`（不碰数据库）与 `weflow-cli assistant log`。
 
 ## 7. 常见问题
 
