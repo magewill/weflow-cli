@@ -15,9 +15,9 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 
 const HOME = mkdtempSync(join(tmpdir(), 'weflow-assistant-tools-'))
 process.env.HOME = HOME
@@ -600,7 +600,12 @@ test('export_chat：导出到 output/exports/ 下的新目录，并报出条数'
   try {
     const out = await run('export_chat', { contact: '甲', limit: 100 })
     assert.match(out, /已导出 42 条/)
-    assert.match(out, /output\/exports\/甲-\d{12}/, '路径固定、带时间戳')
+    // **自定义导出根时只报目录名**：原来这条断言钉的是 `output/exports/甲-…`，而那时写的
+    // 是导出根被改过的情况——于是它把"报错位置"这个 bug 一起钉住了（测试照着代码写、
+    // 不是照着意图写）。默认根那条在下面另一个用例里。
+    assert.match(out, /甲-\d{12}\//, '带时间戳的目录名')
+    assert.doesNotMatch(out, /output\/exports\//, '自定义根时不该假称在 output/exports 下')
+    assert.doesNotMatch(out, new RegExp(HOME.split(sep).pop() as string), '不报本机路径')
     assert.equal(calls[0].talker, 'wxid_a', '显示名要先解析成会话 id')
     assert.equal(calls[0].limit, 100)
     const normalized = calls[0].outDir.split(String.fromCharCode(92)).join('/')
@@ -905,4 +910,106 @@ test('通讯录里匹配到多个：不猜，照旧说没找到', async () => {
       : [])
   const out = await run('get_messages', { contact: '小王' })
   assert.match(out, /没找到/, '有歧义就不许挑一个——宁可让它说不出话，也不能读错人的聊天')
+})
+
+// ------------------------------------------------- 阅读统计（公众号推送 vs 日报处理）
+
+test('get_reading_stats 列出推送最多的号，并把参数传给脚本', async () => {
+  const calls = stubScript(JSON.stringify({
+    success: true,
+    period: { start: '2026-09-17', end: '2026-09-23', days: 7 },
+    sources: [
+      { name: '甲号', pushed: 248, processed: 12 },
+      { name: '乙号', pushed: 156, processed: 30 },
+      { name: '丙号', pushed: 9, processed: 0 },
+    ],
+  }))
+  const out = await run('get_reading_stats', { days: 7 })
+
+  assert.match(out, /3 个公众号有推送/)
+  assert.match(out, /发得最多：甲号\(248\)、乙号\(156\)、丙号\(9\)/)
+  assert.match(out, /日报处理得最多：乙号\(30\)、甲号\(12\)/, '按处理数排序，0 的不列')
+  assert.deepEqual(calls[0].args, ['--days', '7', '--json'])
+  assert.match(calls[0].script, /daily_stats\.py$/)
+})
+
+test('日报没在跑时直说"没在跑"，而不是让用户以为那些号没内容', async () => {
+  // 实测就是这么发现的：最近 7 天 processed 全是 0，而 30 天窗口里全是非零——
+  // 差别不在号上，在**日报从 09-05 起就没再跑过**。
+  stubScript(JSON.stringify({
+    success: true, period: { start: '2026-09-17', end: '2026-09-23' },
+    sources: [{ name: '甲号', pushed: 248, processed: 0 }],
+  }))
+  const out = await run('get_reading_stats', { days: 7 })
+  assert.match(out, /日报没有任何处理记录/)
+  assert.doesNotMatch(out, /日报处理得最多/, '全是 0 就别列"处理得最多"')
+  // 那句补充**是可选的**，因为它是从本机 `output/biz-daily` 扫出来的：CI 是干净检出、
+  // 没有归档，那时就没有这句。第一条写成了必有的断言，CI 当场红了（这已经是第二次：
+  // 上一次是测试依赖了本地装了而 CI 没装的 html2text）。所以这里钉的是**形状**，不是存在。
+  assert.match(out, /日报没有任何处理记录(；最近一次有内容的日报是 \d{4}-\d{2}-\d{2}（\d+ 天前）)?$/)
+})
+
+test('脚本失败时如实说失败', async () => {
+  stubScript('', 2, '需要 sqlcipher3')
+  assert.match(await run('get_reading_stats', {}), /读取公众号统计失败/)
+})
+
+test('days 越界变成可读的参数错误', async () => {
+  assert.equal(await run('get_reading_stats', { days: 999 }), '(参数错误: days 必须是 1-90 的整数)')
+})
+
+// ------------------------------------------------- 写工具的"写到了哪"必须是真的
+
+test('export_chat 报的是真的落盘位置：撞名带序号，自定义根不泄露绝对路径', async () => {
+  // 实测（真库验收）：第二次导出明明写进了 `…-2`，消息里报的却是基础名——因为路径是**事前拼的**，
+  // 不是从 `outDir` 来的。写工具报错位置比不报更糟：用户照着找，找不到。
+  const root = mkdtempSync(join(tmpdir(), 'weflow-export-branch-'))
+  const realExport = exportService.exportTxt.bind(exportService)
+  let calls = 0
+  ;(exportService as any).exportTxt = async (_talker: string, outDir: string) => {
+    calls += 1
+    mkdirSync(outDir, { recursive: true })
+    return { success: true, count: 3 }
+  }
+  process.env.WEFLOW_ASSISTANT_EXPORT_ROOT = root
+  svc.listSessions = async () => ([{ displayName: '甲', username: 'wxid_a' }])
+  try {
+    const first = await run('export_chat', { contact: '甲', format: 'txt' })
+    const second = await run('export_chat', { contact: '甲', format: 'txt' })
+
+    assert.equal(calls, 2)
+    assert.match(first, /已导出 3 条消息到 /)
+    // 临时根的目录名（不含路径分隔符），出现在消息里就说明报了绝对路径
+    const rootName = root.split(sep).pop() as string
+    assert.doesNotMatch(first, new RegExp(rootName), '不许把绝对路径报进聊天')
+    assert.doesNotMatch(first, /^\S*[A-Za-z]:/, '消息里不该出现盘符')
+
+    const nameOf = (text: string) => text.match(/到 ([^（]+)（/)?.[1] ?? ''
+    assert.notEqual(nameOf(first), nameOf(second), '第二次撞名了，报的名字就该不一样')
+    assert.match(nameOf(second), /-2\/$/, `第二次要报带序号的那个目录：${nameOf(second)}`)
+  } finally {
+    ;(exportService as any).exportTxt = realExport
+    delete process.env.WEFLOW_ASSISTANT_EXPORT_ROOT
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('export_chat 用默认导出根时，报的是相对路径（照得着，也不泄露本机路径）', async () => {
+  // 默认根 = 仓库的 output/exports。这条把上一条缺的那半补上：**默认情况下**消息里应当是
+  // `output/exports/<目录名>`，用户照着找得到；而不是绝对路径。
+  const realExport = exportService.exportTxt.bind(exportService)
+  ;(exportService as any).exportTxt = async (_talker: string, outDir: string) => {
+    mkdirSync(outDir, { recursive: true })
+    return { success: true, count: 7 }
+  }
+  delete process.env.WEFLOW_ASSISTANT_EXPORT_ROOT
+  svc.listSessions = async () => ([{ displayName: '甲', username: 'wxid_a' }])
+  try {
+    const out = await run('export_chat', { contact: '甲', format: 'txt' })
+    assert.match(out, /已导出 7 条消息到 output\/exports\/甲-\d{12}\//)
+    // 注意：这条断言本身踩过 heredoc——`[\\/]` 经 shell 会变成 `[\/]`，等于只挡正斜杠。
+    assert.doesNotMatch(out, /[A-Za-z]:/, '不该出现盘符（正反斜杠都不行）')
+  } finally {
+    ;(exportService as any).exportTxt = realExport
+  }
 })

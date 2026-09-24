@@ -3,12 +3,13 @@
  * 所有工具在本机执行; 结果经 PrivacyGate 脱敏后才进入 LLM 上下文。
  */
 import { chatService } from './chatService.js'
+import { configService } from './configService.js'
 import { runPythonJson } from './pythonBridge.js'
 import { exportService } from './exportService.js'
 import type { AssistantMemory } from './assistantMemory.js'
 import { privacyGate } from './assistantPrivacy.js'
 import { existsSync, readFileSync, readdirSync } from 'fs'
-import { join } from 'path'
+import { basename, join } from 'path'
 // 直接调进程的写法已收敛进 pythonBridge：这里不再 import child_process
 import { resolvePackageRoot } from '../utils/packageRoot.js'
 import type { Contact } from '../types.js'
@@ -162,6 +163,24 @@ export function extractText(html: string): string {
 /** 确保数据库已连接 (connect 幂等, 已连接时直接返回) */
 async function ensureDb(): Promise<void> {
   await chatService.connect()
+}
+
+/** 最近一份**有内容**的日报是哪天，以及那是几天前。算不出来就回空串——不猜。 */
+function lastDailyNote(): string {
+  try {
+    const days = readdirSync(BIZ_DAILY_DIR)
+      .filter(name => /^\d{4}-\d{2}-\d{2}$/.test(name)).sort().reverse().slice(0, 30)
+    for (const day of days) {
+      const file = join(BIZ_DAILY_DIR, day, '.articles.json')
+      if (!existsSync(file)) continue
+      const payload = JSON.parse(readFileSync(file, 'utf8'))
+      if ((payload?.articles ?? []).length) {
+        const ago = Math.round((Date.now() - new Date(`${day}T00:00:00`).getTime()) / 86_400_000)
+        return `；最近一次有内容的日报是 ${day}（${ago} 天前）`
+      }
+    }
+  } catch { /* 扫不出来就什么都不说，而不是猜一个日期 */ }
+  return ''
 }
 
 interface TalkerCandidate {
@@ -382,7 +401,8 @@ export const TOOL_DEFS: ToolDef[] = [
     type: 'function',
     function: {
       name: 'search_chats',
-      description: '在自己所有聊天记录里检索「在哪聊过某件事」。适合「上次说的那个部署方案是在哪聊的」'
+      description: '在**聊天记录**里检索「在哪聊过某件事」，按字面词匹配。适合「上次说的那个部署方案是在哪聊的」。'
+        + '（知识库用 search_knowledge；助手记得的关于你的事用 search_memory）'
         + '「谁提过这个客户」这类问题。它只匹配字面词（同义改写要靠别的路子），所以问题描述得具体些。'
         + '代价：会把你的问题与候选词发给判断模型（不发聊天正文），约 1-2 秒。',
       parameters: {
@@ -413,7 +433,8 @@ export const TOOL_DEFS: ToolDef[] = [
     type: 'function',
     function: {
       name: 'search_semantic',
-      description: '按**意思**找（语义/同义检索），而 search_chats 只匹配字面词。'
+      description: '按**意思**找聊天记录（语义/同义检索），而 search_chats 只匹配字面词——'
+        + '想不起原话、只记得大意时用它。'
         + '「上次说的那个部署方案是在哪聊的」用 search_chats；「和钱有关的讨论」这种同义改写用这条。'
         + '代价：查询词会发给阿里云百炼做嵌入、候选片段会发给判断模型重排（都是仓库既有的云端路径），'
         + '需要先建过索引（weflow-cli search-index）。',
@@ -449,7 +470,8 @@ export const TOOL_DEFS: ToolDef[] = [
     type: 'function',
     function: {
       name: 'search_knowledge',
-      description: '搜索用户的本地知识库(从公众号文章沉淀的 Wiki 概念页与学习日报)。适合查概念解释、找之前整理过的知识。',
+      description: '搜索**本地知识库**（从公众号文章沉淀的 Wiki 概念页与学习日报），适合查概念解释、找之前整理过的知识。'
+        + '（聊天里说过什么用 search_chats；助手记得的关于你的事用 search_memory）',
       parameters: {
         type: 'object',
         properties: {
@@ -470,8 +492,24 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     type: 'function',
     function: {
+      name: 'get_reading_stats',
+      description: '公众号推送与日报处理的统计：哪些号发得多、哪些被日报处理得多。'
+        + '回答"我最近都在读什么/哪个号发得最多"这类问题时用它。'
+        + '**日报没在跑的时候它会直说**（那不是"没内容"）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: '统计最近多少天，默认 7，上限 90' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'search_memory',
-      description: '搜索助手关于用户的长期记忆(此前对话中提取的持久事实)。',
+      description: '搜索**助手记得的关于你的事**（此前对话里提取的长期事实：偏好、项目、关系）。'
+        + '（聊天正文用 search_chats，整理过的知识用 search_knowledge）',
       parameters: {
         type: 'object',
         properties: {
@@ -529,6 +567,32 @@ export function producedContent(text: string): boolean {
   const head = (text ?? '').trimStart()
   if (!head.startsWith('(')) return true
   return PAREN_SUCCESS_PREFIXES.some(prefix => head.startsWith(prefix))
+}
+
+/**
+ * 这台机器上**跑不了**的工具，不该出现在工具表里。
+ *
+ * 为什么按配置过滤：模型看见工具就会去试。这台机器没配 `dashscopeApiKey` 时 `search_semantic`
+ * 必然失败——实测（评测的 `ambiguous-contact` 那次）模型连试两个检索工具、两个都报错，最后答复
+ * 里带着"两个检索工具都跑不通"。那不是助手的问题，是**我们摆了一个跑不了的工具**。工具越少，
+ * 选择也越准。
+ *
+ * 只按"缺了就跑不了"过滤，不按"暂时没数据"过滤——没数据时工具自己会说该运行什么
+ * （`先运行 weflow-cli wiki compile`），那是有用的回答。
+ */
+export function unavailableToolReason(name: string, config: (key: any) => any = configService.get.bind(configService)): string | null {
+  if (name === 'search_semantic' && !String(config('dashscopeApiKey') || '').trim()) {
+    return '语义检索需要 dashscopeApiKey'
+  }
+  if (name === 'get_weread' && !String(config('wereadApiKey') || '').trim()) {
+    return '微信读书需要 wereadApiKey'
+  }
+  return null
+}
+
+/** 这台机器上真正可用的工具表。快路径派发也要过同一道判据（见 `unavailableToolReason`）。 */
+export function availableToolDefs(config?: (key: any) => any): ToolDef[] {
+  return TOOL_DEFS.filter(def => !unavailableToolReason(def.function.name, config))
 }
 
 export async function executeTool(name: string, args: Record<string, any>, ctx: ToolContext): Promise<string> {
@@ -898,7 +962,14 @@ export async function executeTool(name: string, args: Record<string, any>, ctx: 
               : await exportService.exportHtml(talker, outDir, limit, '', undefined, undefined, true)
         if (!result.success) return `(导出失败: ${String(result.error || '未知').slice(0, 100)})`
         const suffix = format === 'html' ? '，含图片' : ''
-        return `已导出 ${result.count ?? 0} 条消息到 output/exports/${safeName}-${stamp}/（${format}${suffix}）`
+        // 报**真的写到了哪**：`outDir` 才是（撞名之后会带 `-2`），而事前拼的 `safeName-stamp`
+        // 两次导出会报成同一个名字——实测第二次明明是 `…-2`，消息里却是基础名（2026-09-23 验收）。
+        // 根目录是默认值时按仓库相对路径报（用户照着找得到）；自定义根时只报目录名——
+        // **不把绝对路径发进聊天**，那是本机路径，没必要出境。
+        const shown = exportRoot === join(PKG_ROOT, 'output', 'exports')
+          ? `output/exports/${basename(outDir)}`
+          : basename(outDir)
+        return `已导出 ${result.count ?? 0} 条消息到 ${shown}/（${format}${suffix}）`
       }
       case 'search_knowledge': {
         const kw = String(args.keyword || '')
@@ -919,6 +990,28 @@ export async function executeTool(name: string, args: Record<string, any>, ctx: 
         const sessions = await chatService.listSessions(undefined, 1000)
         const fav = await chatService.getFavorites({ limit: 1 })
         return `会话数: ${sessions.length}\n收藏总数: ${fav.success ? fav.total : '未知'}`
+      }
+      case 'get_reading_stats': {
+        const days = boundedToolInteger(args.days, 7, 90, 'days')
+        const r = await runPythonJson<any>('daily_stats.py',
+          ['--days', String(days), '--json'], { timeoutMs: 60_000 })
+        if (!r.ok) return fail('读取公众号统计失败', r)
+        const rows: any[] = r.data?.sources ?? []
+        if (!rows.length) return `(最近 ${days} 天没有公众号推送记录)`
+        const period = r.data?.period ?? {}
+        const byPushed = [...rows].sort((a, b) => (b.pushed ?? 0) - (a.pushed ?? 0)).slice(0, 5)
+        const lines = [`最近 ${days} 天（${period.start} 至 ${period.end}）：${rows.length} 个公众号有推送`]
+        lines.push('发得最多：' + byPushed.map(x => `${x.name}(${x.pushed})`).join('、'))
+        const processed = rows.filter(x => (x.processed ?? 0) > 0)
+          .sort((a, b) => (b.processed ?? 0) - (a.processed ?? 0)).slice(0, 5)
+        if (processed.length) {
+          lines.push('日报处理得最多：' + processed.map(x => `${x.name}(${x.processed})`).join('、'))
+        } else {
+          // **直说日报没在跑**：这时"处理数 0"不是"这些号没内容"，而是日报压根没运行。
+          // 把它混成"没读到东西"，用户会去查号，而该查的是日报任务。
+          lines.push(`这 ${days} 天日报没有任何处理记录` + lastDailyNote())
+        }
+        return lines.join('\n')
       }
       case 'search_memory': {
         const hits = ctx.memory.searchFacts(ctx.userId, String(args.keyword || ''))

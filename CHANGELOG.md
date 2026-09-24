@@ -8,6 +8,58 @@ All notable user-facing changes are recorded here. This project follows [Semanti
 
 ### Added
 
+- **The four "search" tools now name each other.** They search four different stores - chat logs,
+  the knowledge base, assistant memory, and a semantic index over chats - and each description used to
+  explain only what it searched, not how it differed from its siblings. `search_knowledge` did not say
+  it is *not* chat history; `search_memory` did not say what "memory" means here. Each now names the
+  store it covers and points at the others. Three eval cases pin the choice ("where did I mention X" must
+  use the chat search and must **not** reach for the knowledge base), which is the part that was never
+  measured.
+
+  Found while writing those cases: **an empty fixture invites retries.** With a stubbed search that
+  returns nothing, the model re-queries with different keywords - seven calls in one run, each with
+  different arguments, so the identical-call guard cannot help. That is the fixture's doing, not a
+  defect, so the fixture now returns a hit (and where it cannot, the count sits in the soft budget).
+
+- **Tools this machine cannot run are no longer offered to the model.** `search_semantic` needs a
+  `dashscopeApiKey` and `get_weread` needs `wereadApiKey`; with neither configured the tools were still
+  in the tool list, so the model tried them and got errors back - the eval's ambiguous-contact case
+  ended with a reply that reported "both search tools failed", which is not the assistant's fault but
+  ours for offering a tool that cannot run. The list is now built by `availableToolDefs()`, which drops
+  a tool when its prerequisite is missing, and the fast path - which dispatches **directly**, bypassing
+  the list - goes through the same predicate before dispatching. The filter is deliberately narrow: it
+  only drops tools that *cannot* run, never tools that merely have no data yet, because "run
+  `weflow-cli wiki compile` first" is a useful answer while an authentication error is not.
+
+- **The eval can now run a conversation, and it separates floors from expectations.** Multi-turn
+  cases let it check the half of memory that was never verified: storing a fact was covered, **using** it
+  was not. `memory-recall` says "remember I'm allergic to peanuts", then asks what to order for dinner;
+  the hard floor is that the fact is in long-term memory, and whether the reply brings it up is reported
+  as a soft expectation - it failed in one run out of three, and an intermittent red trains people to
+  ignore the report. Same principle applied across the board: every `maxTools: 3` became a runaway guard
+  (6) plus an efficiency budget (3), because the same question produced anything from 2 to 7 calls. The
+  criterion is one line: **if the number or expectation moves with the model's route or wording, it is a
+  budget, not a floor.** The only hard cap left is `no-tool`'s 0 - calling a tool when none is needed is
+  a real defect. And `unknown-contact` stopped asserting on wording: the model's way of saying "not
+  found" is unbounded (没找到 / 查不到 / 不存在 / …), so that case now asserts the **observable fact**
+  that the tool call returned nothing.
+
+- **A reading-stats tool, and the eval learned to tell a floor from a budget.** `get_reading_stats`
+  answers "what have I been reading / which accounts post the most" from the local archive (it reuses
+  `daily_stats.py` rather than recomputing the same numbers). Its second purpose is honesty about
+  coverage: when the daily has not run, every account's processed count is zero, and saying "nothing was
+  processed in these 7 days; the last report with content was 2026-09-05 (19 days ago)" is a different
+  statement from letting the user believe those accounts had no content. That is how the staleness was
+  found - a 7-day window showed all zeros while a 30-day window did not, and the difference was not the
+  accounts.
+
+  The eval now separates two things it had conflated: **floors are hard, budgets are soft.** The
+  ambiguous-contact case was failing intermittently on a tool-call cap of 5 while every single run
+  correctly asked which person was meant - the same question produced anywhere from 2 to 7 calls, so
+  the cap was measuring the model's route rather than a defect. `maxTools` is now only a runaway guard
+  (raised to 8) and `toolBudget` reports exceeding the budget as a warning that never fails the run.
+  A flaky case is worse than no case: it teaches people to ignore the report.
+
 - **`contacts -k` only searched the first N rows, and the assistant's name lookup had a blind spot.**
   Two defects found by trying to resolve a person by name on real data. First, the keyword filter ran
   **after** `LIMIT`: `get_contacts` fetched the first `limit` rows of `Name2Id` and only then filtered
