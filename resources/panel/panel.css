@@ -1,0 +1,231 @@
+/* 面板的样式。刻意不引任何外部资源（CSP 是 default-src 'none'），也没有字体图标。 */
+:root {
+  --bg: #17181c;
+  --panel: #1f2126;
+  --line: #2e3138;
+  --text: #e6e7ea;
+  --dim: #9aa0aa;
+  --accent: #4c8bf5;
+  --warn: #e0a23c;
+  --err: #e5645f;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+body { display: flex; flex-direction: column; }
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  -webkit-app-region: drag;          /* Electron 里整条顶栏可以拖窗 */
+}
+
+.brand { font-weight: 600; }
+.status { color: var(--dim); font-size: 12px; }
+
+/* ---------------------------------------------------------------- 悬浮球形态 */
+
+#ball {
+  display: none;
+  width: 100vw;
+  height: 100vh;
+  border-radius: 50%;
+  border: 0;
+  padding: 0;
+  position: relative;
+  cursor: pointer;
+  /* **不要在这里写 `-webkit-app-region: drag`**：Windows 上拖拽区会吞掉鼠标事件，
+     页面收不到 click，球就点不开了（实测的故障就是这个）。拖动自己实现，见 renderer.js。 */
+
+  /* 球本身**没有底色**：下面那层 `.glow` 才是"背景"，上面 `.face` 是吉祥物。
+     图上按内容包围盒裁过（源图 1024² 里内容只占 600x689），自带 12% 余量，铺满即可。 */
+  background-color: transparent;
+
+  /* 投影跟着猫的轮廓走（不是跟着那个不存在的圆），透明主体靠它跟浅色壁纸分开 */
+  filter: drop-shadow(0 6px 12px rgba(0, 0, 0, .50));
+  transition: transform .12s ease, filter .12s ease;
+}
+#ball > span { position: absolute; inset: 0; border-radius: 50%; pointer-events: none; }
+
+/* 会动的那层背景。做成**软边光晕**而不是硬边圆盘：硬边就又回到"一只盘子"了，
+   而软边在浅底与深底上都只是"猫身后的一团光"，不需要再靠一圈亮环去定边界。 */
+#ball .glow {
+  background:
+    radial-gradient(circle at 50% 46%,
+      hsl(var(--hue) 82% 58% / .95) 0%,
+      hsl(calc(var(--hue) + 26) 78% 46% / .78) 38%,
+      hsl(calc(var(--hue) + 44) 70% 38% / .32) 62%,
+      transparent 78%);
+  animation: drift 26s linear infinite;
+}
+
+/* 上面那层：吉祥物本体，形状不变 */
+#ball .face {
+  background-image: url('/panel/mascot.png');
+  background-size: 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+/* 色相缓慢流动 —— 这就是"会变动的背景"。26 秒一圈：够慢，不会在余光里晃。
+   （慢到只有盯着看才注意到，这才是常驻小球该有的动静） */
+@property --hue { syntax: '<number>'; inherits: true; initial-value: 224; }
+#ball { --hue: 224; }
+@keyframes drift {
+  0%   { --hue: 224; }        /* 蓝 */
+  25%  { --hue: 268; }        /* 紫 */
+  50%  { --hue: 316; }        /* 品红 */
+  75%  { --hue: 190; }        /* 青 */
+  100% { --hue: 224; }
+}
+
+/* ---------------------------------------------------------------- 状态 */
+
+/* 正在想事情：光晕变亮、转得快，并且轻轻呼吸。
+   这一条的用处不只是好看——球收起来的时候，此前**完全看不出它在干活**。 */
+body.busy #ball .glow {
+  /* 8 秒转一圈色相（不是 3 秒）：呼吸的节奏交给 1.5s，色相再快就变成闪了 */
+  animation: drift 8s linear infinite, breathe 1.5s ease-in-out infinite;
+}
+@keyframes breathe {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.08); opacity: .82; }
+}
+
+/* 连不上 / 出错：换成暖色并停住流动——不动的东西才会被注意到 */
+body.offline #ball { --hue: 12; }
+body.offline #ball .glow { animation: none; opacity: .9; }
+
+/* 今天的额度用完了：琥珀色 */
+body.quota #ball { --hue: 38; }
+body.quota #ball .glow { animation: none; opacity: .85; }
+
+/* 系统说"减少动态效果"就照办：停掉所有流动，只留静止的光晕 */
+@media (prefers-reduced-motion: reduce) {
+  #ball .glow,
+  body.busy #ball .glow { animation: none; }
+}
+
+#ball:hover { filter: drop-shadow(0 8px 16px rgba(0, 0, 0, .58)) brightness(1.08); }
+#ball:active { transform: scale(.95); }
+
+/* 球形态：把对话那一套全藏掉，页面背景透明（窗口本身也是透明的）。
+   **`html` 也要一起清掉**——只清 `body` 的话根元素那层不透明底色会把整个窗口填满，
+   透明窗口里就会看到一个方块而不是一个圆球。 */
+html:has(body.mode-ball),
+body.mode-ball { background: transparent; }
+body.mode-ball header,
+body.mode-ball main,
+body.mode-ball form,
+body.mode-ball footer { display: none; }
+/* 用 grid 才让 place-items 真的居中；block 只是碰巧靠按钮默认的 text-align 居中 */
+body.mode-ball #ball { display: grid; }
+/* 球形态下不许出现滚动条：busy 的呼吸动画会 scale(1.08)，
+   溢出的那点内容会在 76x76 的窗口里长出滚动条（实测：右侧冒出上下箭头）。 */
+body.mode-ball { overflow: hidden; }
+
+/* 对话形态（有外壳时）才显示"收起" */
+body.mode-chat #collapse { display: inline-block; }
+
+.ghost {
+  margin-left: auto;
+  background: transparent;
+  color: var(--dim);
+  border: 1px solid var(--line);
+  padding: 2px 10px;
+  font-weight: 400;
+  -webkit-app-region: no-drag;
+}
+.ghost:hover { color: var(--text); }
+
+main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.turn { max-width: 92%; white-space: pre-wrap; word-break: break-word; }
+.turn.me { align-self: flex-end; background: var(--accent); color: #fff; padding: 7px 11px; border-radius: 12px 12px 2px 12px; }
+.turn.it { align-self: flex-start; background: var(--panel); padding: 7px 11px; border-radius: 12px 12px 12px 2px; }
+.turn.sys { align-self: center; color: var(--dim); font-size: 12px; text-align: center; }
+.turn.err { align-self: stretch; border: 1px solid var(--err); color: var(--err); padding: 7px 11px; border-radius: 10px; }
+.turn.pending { color: var(--dim); font-style: italic; }
+
+/* ---------------------------------------------------------------- 还没聊过时的开头 */
+
+.empty {
+  margin: auto 0;                 /* 垂直居中一点，不要贴着顶 */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 2px;
+}
+.empty-title { font-weight: 600; }
+.empty-sub { color: var(--dim); font-size: 12px; margin-bottom: 6px; }
+
+/* 例子做成扁平的胶囊按钮：全局 button 那套（蓝底、大内边距）在这儿太重了 */
+.chip {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-weight: 400;
+  font-size: 13px;
+  padding: 5px 12px;
+  border-radius: 999px;
+}
+.chip:hover { border-color: var(--accent); color: #fff; }
+
+form {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+textarea {
+  flex: 1;
+  resize: none;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+textarea:focus { outline: none; border-color: var(--accent); }
+
+button {
+  padding: 0 16px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { opacity: .45; cursor: default; }
+
+footer {
+  padding: 6px 14px 10px;
+  color: var(--dim);
+  font-size: 12px;
+}
+footer .warn { color: var(--warn); }

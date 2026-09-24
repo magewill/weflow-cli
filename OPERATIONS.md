@@ -547,6 +547,40 @@ weflow-cli daily-server --date YYYY-MM-DD --open
 weflow-cli daily-stats --days 30 --limit 30
 ```
 
+### 让它每天自己跑（日报不会自己发生）
+
+**没有任何地方给日报排期，它就不会跑**——这是"日报怎么好几天没更新"最常见的答案。
+先确认流水线本身是好的（只读、不写盘、不调 AI）：
+
+```powershell
+weflow-cli daily --dry-run --json     # 看它读到多少篇、准备处理哪一天
+```
+
+正常会打印当天扫到的文章数与一个 `{"success":true,"dryRun":true,...}`。读到几百篇就说明
+读取没问题，缺的只是一个触发。交给计划任务（与「WeFlow Health Check」同一套做法，
+不依赖任何编辑器或会话开着）：
+
+```powershell
+schtasks /create /tn "WeFlow Daily" ^
+  /tr "weflow-cli daily --yes" ^
+  /sc daily /st 08:20
+```
+
+- 查看：`Get-ScheduledTask -TaskName 'WeFlow Daily'`
+- 手动跑一次：`Start-ScheduledTask -TaskName 'WeFlow Daily'`
+- 上次结果：`schtasks /query /tn "WeFlow Daily" /fo LIST /v`
+
+几点要事先知道：
+
+- **`--yes` 不能省**：机器模式下没有它就会停在确认门上（这是有意的——日报会调 AI、会写文件）。
+- **会花钱**：默认跑 AI（摘要/标签/简报）。想让它不出网、不花钱就用
+  `weflow-cli daily --yes --no-ai`；只要主题与相关度、不要摘要可用 `--no-summary`。
+- **没跑成留下的空目录不等于跑过了**：一个只有目录、没有 `README.md` / `.articles.json` /
+  `index.html` 的日期**不算完成**，再跑一次不带日期的 `daily` 会先把它补上（D-011）。
+  所以看到 `output/biz-daily/2026-09-22/` 这种空目录时，处理办法就是再跑一次，
+  不需要手工删。
+- **别把触发条件设成"上次成功才跑"**：那样第一次失败之后就再也不会被触发了。
+
 ## 6. AI 和助手
 
 日报关闭 AI 不会自动关闭其他命令的 AI。报告、RAG、助手和证据线索分析分别按命令参数和配置决定是否调用模型。云端分析前应确认输入范围、供应商和隐私设置；优先使用本地模型处理聊天正文。
@@ -559,6 +593,68 @@ weflow-cli login-wechat
 weflow-cli assistant start
 weflow-cli assistant status
 ```
+
+### 本机面板：不扫码也能跟助手说话
+
+```powershell
+weflow-cli panel                # 打开面板窗口（没在跑就先起守护进程）
+weflow-cli panel --status       # 只看状态，不开窗口
+weflow-cli panel --ask "我最近在关注什么" --yes   # 在命令行里问一句
+```
+
+面板与微信里问的是**同一个大脑**：同一份记忆、同一条每日配额、同一条串行队列。窗口只是客户端，
+消息走守护进程开在 `127.0.0.1:8766` 上的入口。**没有登录微信也能用**——消息通道是可选的
+（`assistant start` 在没有 token 时会以"本机入口模式"启动，日志里会写明）。
+
+判据看 `assistant status`：它把"配了 token 吗"（`messageChannelLoggedIn`）和"通道真的接上了吗"
+（`channelActive` / `mode`）分开报，另外给出本机入口端口与**记忆桶**。
+
+**记忆桶决定是不是"共用一个大脑"**：事实是按会话 id 分存的，所以面板用的是哪个 id 就等于
+它跟谁共享记忆。白名单里恰好一个人时自动用那个 id；零个或两个以上**不会猜**——它会用独立的
+`panel` 桶并在界面上写明"与微信那边是分开的"。要指定就用：
+
+```powershell
+weflow-cli config set assistantPanelUser "o9cq80...@im.wechat"   # 改完重启助手
+```
+
+**悬浮球 vs 浏览器小窗**：真·悬浮球（无边框、置顶、托盘、`Ctrl+Shift+W`）需要 Electron：
+
+```powershell
+npm i -g electron
+```
+
+没装 Electron 时会降级用 Edge/Chrome 的 `--app` 打开同一个界面——那是一个没有地址栏的小窗，
+**但给不了悬浮球**，命令输出里会这么说。它用的是独立 profile 目录
+`~/.weflow-cli/panel-browser-profile`（不蹭你日常那个浏览器），删掉它即可清掉那个窗口的状态。
+
+**关掉窗口 ≠ 停止助手**：窗口没了，守护进程还在跑（微信那边可能还在用）。要停：
+
+```powershell
+weflow-cli assistant stop
+```
+
+托盘的"退出并停止助手"是同一个动作。
+
+排障：
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| `panel --status` 报 `PANEL_NOT_RUNNING` | 助手没在跑，或端点文件是崩溃残留（读取端会探活，进程没了就当没有）：先 `assistant start` |
+| 日志里 `本机入口启动失败: 端口 8766 已被占用` | 别的程序占了 8766。找出它并停掉，或先停掉重复启动的助手 |
+| 面板显示"连不上本机入口" | 守护进程刚被停掉，或那个端口上的不是助手（端点带 `service` 字段做身份校验） |
+| 面板里"凭据失效了" | 助手重启过，token 每轮都换（这是设计）。重新 `weflow-cli panel` 打开 |
+
+手工验证端点（想确认它真的只绑回环、真的认 token 时）：
+
+```powershell
+# 端口与 token 在 ~/.weflow-cli/assistant_endpoint.json 里；token 不要贴到别处
+curl.exe -i http://127.0.0.1:8766/api/status                       # 401（没 token）
+curl.exe -i -H "Authorization: Bearer <token>" http://127.0.0.1:8766/api/status   # 200
+```
+
+**中文别用 Git Bash 的 `curl -d '中文'`**：那条路径会把正文按控制台代码页编出去，
+助手收到的是乱码（实测过）。要手工发就写成文件用 `--data-binary @文件`，
+或者直接用 `panel --ask`。
 
 ### 助手能读到多少：隐私三档，以及本地引擎这个例外
 

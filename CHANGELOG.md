@@ -8,6 +8,92 @@ All notable user-facing changes are recorded here. This project follows [Semanti
 
 ### Added
 
+- **The panel's ball wears the project mascot, with a transparent background.** `resources/panel/mascot.png`
+  is served through the panel's static whitelist and drawn with **no disc behind it** - a mascot floating on
+  the desktop rather than sitting on a plate - separated from light wallpapers by a `drop-shadow` that
+  follows its outline. Three things about it were measured rather than eyeballed: the source
+  (`weflow-cli图标.png` at the repo root) is 1024x1024 but its **content occupies only 600x689**, so the
+  shipped asset is cropped to the alpha bounding box and resized to 256 (41KB rather than 1.37MB), which is
+  what makes the mascot fill the space instead of floating small inside it; the source's background is
+  **transparent**, so nothing needs keying; and the outline the ball used to have (a 1px light ring, drawn
+  for the disc) had to go with it - with no disc it draws a circle in empty space. Dropping the ring is
+  easy to forget, so a test asserts the two changes travel together.
+
+  An earlier revision of this entry claimed the transparent version "loses the cat's body into a dark
+  background". **That was my misreading of a small comparison image** in which the mascot was rendered too
+  small; at the real size (76 logical pixels, inspected at 3x against light, mid and dark backdrops) it
+  reads fine on all three. The user picked transparent after seeing both.
+
+  The **tray icon is a separate asset** (`tray.png`) with the disc baked in: at 16-24 pixels on a dark
+  taskbar there is no drop-shadow to lean on, so the disc is what keeps the outline legible. `nativeImage`
+  cannot composite, so that one is generated with a canvas and committed.
+
+- **The ball's background moves, and it says what the assistant is doing.** Behind the mascot there is now
+  a soft-edged glow (deliberately not a hard disc - a hard edge is "sitting on a plate" again) whose hue
+  drifts on a 26-second loop, slow enough that it is only noticeable if you look at it. Its **state**
+  changes are the useful half: while a turn is in flight it brightens and breathes, and when the daemon
+  cannot be reached it goes warm and **stops moving** (a still thing is what gets noticed). A collapsed ball
+  previously gave no sign at all that it was working. `prefers-reduced-motion` turns all of it off, and the
+  three state classes are set from one function so a branch cannot forget to clear `busy` and leave the ball
+  glowing "working" forever - a test asserts that, and that no other code touches those class names.
+
+  Two details that came out of looking at the renders rather than the code: the breathing animation's
+  `scale(1.08)` overflowed the 76x76 window and produced a **scrollbar** inside the ball (visible as
+  up/down arrows in a screenshot), so ball mode is `overflow: hidden`; and the glow is a separate layer from
+  the mascot so the background can animate while the cat stays put.
+
+- **The panel window no longer opens to an empty void.** It used to show nothing but black until you
+  typed, which says neither what the assistant can do nor that it is alive. It now opens with a
+  one-line explanation (including that the database never leaves the machine) and four **clickable**
+  example questions that submit through the same path as typing. Verified end to end by clicking one
+  through the DevTools protocol: the example block gives way, the question becomes a real turn, and
+  the answer comes back through the shared quota counter (`[panel] 9字 → 已回复 (427字, 今日 1/100)`).
+
+- **A local panel: talk to the assistant without logging into the WeChat channel.** Until now the only
+  way in was the WeChat Bot channel, which requires scanning a QR code - so asking one question cost a
+  login. `weflow-cli panel` opens a small always-on-top window that talks to the same brain: the same
+  memory, the same daily quota, the same serial queue. It works with the channel logged out. Memory is
+  shared rather than duplicated because facts are stored per conversation id and the panel resolves to
+  the **single** allowlisted id when there is exactly one; with none or several it does not guess - it
+  uses its own bucket and **says so on screen**, because "separate memory that you think is shared" is
+  the exact failure this arrangement invites. `assistantPanelUser` pins the choice.
+
+  The window is a client, never a second assistant (D-045). `weflow-cli panel --status --json` reports
+  it, `panel --ask "…"` asks a question from the terminal, and both go through the same loopback
+  endpoint the window uses. The endpoint binds `127.0.0.1` and cannot be configured otherwise
+  (continuing D-004), but it is deliberately stricter than the daily reader: **every** request needs a
+  per-run token, Origin is a second gate, and POSTs must be JSON. The token never reaches a command
+  line - the Electron shell reads the endpoint file itself and installs the token as an `HttpOnly`
+  cookie, while the browser fallback uses a one-time 60-second code.
+
+  Also in this change, because the panel made them visible: `assistant start` **no longer refuses to
+  start when the WeChat channel is not logged in** (it used to throw before doing anything, so
+  "not logged in" meant "no assistant at all" - a field observation recorded in PROJECT_STATE), and
+  `assistant status` gained `channelActive` / `mode` / `panelPort` / `memoryBucket`, because
+  `messageChannelLoggedIn` only ever answered "is a token configured".
+
+  **The ball needs Electron, and Electron is not a dependency**: with none installed, `panel` falls
+  back to Edge/Chrome `--app` - a small window without an address bar, but **not** a floating ball (no
+  frameless, no always-on-top, no tray, no global hotkey), and the command says so. Install Electron
+  (`npm i -g electron`, or `npm install` in a checkout - the binary is downloaded by its own install
+  script) and the same command opens the ball. Verified on Windows 11 with Electron 42: 76x76, no
+  caption, always-on-top, the renderer authenticates through the cookie, and the ball is visible on
+  screen, and the interactive paths were driven without a click (DevTools protocol for the ball-to-chat
+  resize, a differential registration test for the hotkey). Doing that found two bugs a screenshot
+  could not have shown: collapsing left the window at chat size because a non-resizable window
+  ignores `setSize` on Windows, and the window sometimes never appeared because `ready-to-show` was
+  listened for only after the load. A third came out of running what the tray items actually do: the
+  "quit and stop the assistant" action spawned the CLI in a form commander rejects inside Electron's
+  Node mode. Only a click on the tray menu itself remains untested; each item's effect has been run
+  directly.
+
+  The ball also now **sits in the bottom-right corner and stays where you drag it**. It used to open
+  wherever Windows felt like it (measured 815,418, mid-left) and forget the position on every
+  restart. The remembered spot is checked before use: if it is no longer reachable - a monitor was
+  unplugged, or the ball was dragged off-screen - it falls back to the corner instead of leaving the
+  ball somewhere invisible. Expanding to the chat window and collapsing back re-fit into the work
+  area, so a 420x560 window no longer hangs off the screen when opened from a bottom-right corner.
+
 - **The four "search" tools now name each other.** They search four different stores - chat logs,
   the knowledge base, assistant memory, and a semantic index over chats - and each description used to
   explain only what it searched, not how it differed from its siblings. `search_knowledge` did not say
@@ -208,6 +294,31 @@ All notable user-facing changes are recorded here. This project follows [Semanti
   `[图片]` is still masked as text: only the reader's own non-text labels count as labels.
 
 ### Fixed
+
+- **Clicking the ball did nothing.** The ball carried `-webkit-app-region: drag` so it could be dragged -
+  and on Windows a drag region **swallows mouse events**, so the page never received the click. Dragging is
+  now implemented in the page itself (pointer events, with a 4-pixel threshold that separates a click from
+  a drag) and the native drag region is gone. The verification is the part worth recording: this had been
+  "verified" earlier by calling `element.click()` through the DevTools protocol, which **bypasses real
+  input** and happily reported a ball that could not be clicked. Both the new click and the drag are now
+  confirmed with synthetic-but-real mouse input (`SetCursorPos` + `mouse_event`): 78x76 -> 421x560 -> 77x76,
+  and a drag that moves the window without changing its size.
+
+- **Dragging made the ball grow.** `win.setPosition` / `win.setBounds` on this window (frameless,
+  transparent, non-resizable) operate on the **outer** rect and drift a little on every call - measured at
+  roughly +0.8px per call, with no bound: 20 moves took 76x76 to 97x92, and the same happens without any
+  mouse involved (calling the drag IPC directly reproduces it). `setContentBounds` (the client area) is
+  stable - 20 moves, size unchanged. The same drift was quietly affecting `setMode` too: expanding measured
+  421x561 rather than the requested 420x560.
+
+ Every "atomic write" in this project (the memory file,
+  the configuration, the panel's endpoint file) wrote a `.tmp` and renamed it over the target - and on
+  Windows `rename` fails with `EPERM` when another handle has the target open, which antivirus and search
+  indexers do briefly and routinely. The callers all record a reason and carry on, so the visible effect
+  was nothing at all: one full-suite run here saved the memory file and the file came back without its
+  `version` field, with the test green on the other three runs. The write now retries a busy target and
+  then falls back to writing in place (D-046) - the bytes are the same either way, so only the atomicity of
+  that single write is given up, and the test that reproduces it is in the suite.
 
 - **"No pending todos" and "todos were never extracted" were the same sentence.** Todo extraction reads
   chat logs, so it runs only when the user invokes `weflow-cli todos extract --days N --yes` - it is a
