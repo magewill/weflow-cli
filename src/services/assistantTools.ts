@@ -4,6 +4,7 @@
  */
 import { chatService } from './chatService.js'
 import { runPythonJson } from './pythonBridge.js'
+import { exportService } from './exportService.js'
 import type { AssistantMemory } from './assistantMemory.js'
 import { privacyGate } from './assistantPrivacy.js'
 import { existsSync, readFileSync, readdirSync } from 'fs'
@@ -216,15 +217,14 @@ export const TOOL_DEFS: ToolDef[] = [
     type: 'function',
     function: {
       name: 'search_favorites',
-      description: '搜索用户的微信收藏(主要是收藏的公众号文章)。',
+      description: '搜索用户的微信收藏(主要是收藏的公众号文章)；**不给关键词就是最近收藏了什么**。',
       parameters: {
         type: 'object',
         properties: {
           keyword: { type: 'string', description: '搜索关键词' },
           limit: { type: 'number', description: '返回条数, 默认8' },
         },
-        required: ['keyword'],
-      },
+              },
     },
   },
   {
@@ -266,7 +266,7 @@ export const TOOL_DEFS: ToolDef[] = [
       parameters: {
         type: 'object',
         properties: {
-          mode: { type: 'string', description: 'timeline (最新动态) 或 stats (统计), 默认 timeline' },
+          mode: { type: 'string', description: 'timeline (最新动态) / stats (统计) / users (谁发得最多), 默认 timeline' },
           limit: { type: 'number', description: 'timeline 模式条数, 默认10' },
         },
       },
@@ -327,6 +327,42 @@ export const TOOL_DEFS: ToolDef[] = [
         properties: {
           days: { type: 'number', description: '只看最近多少天有动静的会话，默认 14' },
         },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_semantic',
+      description: '按**意思**找（语义/同义检索），而 search_chats 只匹配字面词。'
+        + '「上次说的那个部署方案是在哪聊的」用 search_chats；「和钱有关的讨论」这种同义改写用这条。'
+        + '代价：查询词会发给阿里云百炼做嵌入、候选片段会发给判断模型重排（都是仓库既有的云端路径），'
+        + '需要先建过索引（weflow-cli search-index）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '要找的意思，用自然语言描述' },
+          top_k: { type: 'number', description: '要几条，默认 8，上限 20' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'export_chat',
+      description: '把某个人的聊天记录导出成 HTML（含图片），落到 output/exports/ 下。'
+        + '适合「帮我把和某某的聊天导出备份一下」。**会写文件**：每次新建一个带时间戳的目录，绝不覆盖已有的，'
+        + '路径也不是你给而是固定的。',
+      parameters: {
+        type: 'object',
+        properties: {
+          contact: { type: 'string', description: '联系人显示名或备注名' },
+          limit: { type: 'number', description: '最多导出多少条，默认 500，上限 5000' },
+          format: { type: 'string', description: 'html(默认,含图片) / txt / json / excel' },
+        },
+        required: ['contact'],
       },
     },
   },
@@ -425,12 +461,14 @@ export async function executeTool(name: string, args: Record<string, any>, ctx: 
       }
       case 'search_favorites': {
         await ensureDb()
+        // 不给关键词就是"最近收藏了什么"——这一问在聊天里很自然，没理由逼调用方编一个词
         const keyword = String(args.keyword || '')
-        if (!keyword) return '(缺少 keyword 参数)'
-        const limit = boundedToolInteger(args.limit, 8, 15)
-        const r = await chatService.getFavorites({ keyword, limit })
+        const limit = boundedToolInteger(args.limit, keyword ? 8 : 15, keyword ? 15 : 30)
+        const r = keyword ? await chatService.getFavorites({ keyword, limit })
+          : await chatService.getFavorites({ limit })
         if (!r.success || !r.favorites?.length) {
-          return r.error ? `(查询失败: ${r.error})` : `(收藏中未搜到「${keyword}」)`
+          if (r.error) return `(查询失败: ${r.error})`
+          return keyword ? `(收藏中未搜到「${keyword}」)` : '(收藏是空的，或收藏库还没连上)'
         }
         return `共${r.total}条, 前${r.favorites.length}条:\n` +
           r.favorites.map(f => {
@@ -517,6 +555,22 @@ export async function executeTool(name: string, args: Record<string, any>, ctx: 
       }
       case 'get_sns': {
         await ensureDb()
+        if (String(args.mode || 'timeline') === 'users') {
+          // 谁常发朋友圈：本地把最近的时间线按发帖人聚合。**不新增出境**——数据本来就在这一条工具里。
+          const r = await chatService.getSnsTimeline({ limit: 200 })
+          if (!r.success || !r.timeline?.length) {
+            return r.error ? `(朋友圈查询失败: ${r.error})` : '(朋友圈暂无缓存数据)'
+          }
+          const byAuthor = new Map<string, number>()
+          for (const post of r.timeline) {
+            const who = String(post.nickname || post.username || '未知')
+            byAuthor.set(who, (byAuthor.get(who) ?? 0) + 1)
+          }
+          const ranked = [...byAuthor.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
+          const nl = String.fromCharCode(10)
+          return `最近 ${r.timeline.length} 条朋友圈里，发得最多的：`
+            + ranked.map(([who, n]) => `${nl}· ${who}：${n} 条`).join('')
+        }
         if (String(args.mode || 'timeline') === 'stats') {
           const r = await chatService.getSnsExportStats()
           if (!r.success) return `(朋友圈统计失败: ${r.error})`
@@ -616,6 +670,59 @@ export async function executeTool(name: string, args: Record<string, any>, ctx: 
         }
         lines.push('（想看某人具体说了什么，用 get_messages 单独查；这里只报谁在等。）')
         return lines.join('\n')
+      }
+      case 'search_semantic': {
+        // 语义/同义检索（向量相似度 + 决策模型重排）。字面词搜不到时用这条。
+        // **出境说明**：查询词要发阿里云百炼做嵌入，候选片段要发判断模型重排——
+        // 两者都在仓库既有的云端路径上（不是新类别），但这里如实写出来。
+        const query = String(args.query || '').trim()
+        if (!query) return '(缺少 query 参数)'
+        const topK = boundedToolInteger(args.top_k, 8, 20, 'top_k')
+        // **查询词走环境变量、不进 argv**：仓库写进测试的隐私纪律（进程列表里看不到正文）
+        const result = await runPythonJson<any[]>('semantic_search.py',
+          ['search', '--top-k', String(topK)],
+          { env: { WEFLOW_SEARCH_QUERY: query }, timeoutMs: 90_000 })
+        if (!result.ok) return fail('语义检索失败（索引可能还没建：weflow-cli search-index）', result)
+
+        const rows = Array.isArray(result.data) ? result.data : []
+        if (!rows.length) return `(语义检索没有结果「${query}」)`
+        return `语义检索「${query}」前 ${rows.length} 条：` + String.fromCharCode(10) + rows.map((row: any) => {
+          const title = String(row.title || row.source || '(无标题)').slice(0, 40)
+          const score = typeof row.score === 'number' ? `（${row.score.toFixed(2)}）` : ''
+          const text = privacyGate.maskMessageBody(
+            String(row.text || row.content || '').replace(/\s+/g, ' ').slice(0, 80))
+          const nl = String.fromCharCode(10)
+          return `· ${title}${score}${text ? nl + '    ' + text : ''}`
+        }).join(String.fromCharCode(10))
+      }
+      case 'export_chat': {
+        // **写操作**，边界写死：只往 output/exports/ 下**新建**目录（名字带时间戳），绝不覆盖；
+        // 路径由这里拼，模型给不了任意路径。用户是在对话里明确要求的，这就是那次确认。
+        const contact = String(args.contact || '').trim()
+        if (!contact) return '(缺少 contact 参数)'
+        const limit = boundedToolInteger(args.limit, 500, 5000, 'limit')
+        const format = String(args.format || 'html').toLowerCase()
+        if (!['html', 'txt', 'json', 'excel'].includes(format)) {
+          return `(参数错误: format 只能是 html/txt/json/excel，收到 ${format.slice(0, 12)})`
+        }
+        const talker = await resolveTalker(contact)
+
+        const safeName = contact.replace(/[\/:*?"<>|]/g, '_').slice(0, 20) || 'chat'
+        const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12)
+        // 目录名到秒，同一秒里导两次会撞进同一个目录——那就不是"绝不覆盖"了。撞了就往后加序号。
+        // 导出根目录可用环境变量改（测试用临时目录；也方便自定义）。默认在仓库的 output/exports 下。
+        const exportRoot = process.env.WEFLOW_ASSISTANT_EXPORT_ROOT || join(PKG_ROOT, 'output', 'exports')
+        let outDir = join(exportRoot, `${safeName}-${stamp}`)
+        for (let n = 2; existsSync(outDir) && n < 100; n++) {
+          outDir = join(exportRoot, `${safeName}-${stamp}-${n}`)
+        }
+        const result = format === 'txt' ? await exportService.exportTxt(talker, outDir, limit)
+          : format === 'json' ? await exportService.exportJson(talker, outDir, limit)
+            : format === 'excel' ? await exportService.exportExcel(talker, outDir, limit)
+              : await exportService.exportHtml(talker, outDir, limit, '', undefined, undefined, true)
+        if (!result.success) return `(导出失败: ${String(result.error || '未知').slice(0, 100)})`
+        const suffix = format === 'html' ? '，含图片' : ''
+        return `已导出 ${result.count ?? 0} 条消息到 output/exports/${safeName}-${stamp}/（${format}${suffix}）`
       }
       case 'search_knowledge': {
         const kw = String(args.keyword || '')

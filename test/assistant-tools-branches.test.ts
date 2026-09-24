@@ -15,7 +15,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -27,6 +27,7 @@ const { chatService } = await import('../src/services/chatService.js')
 const { wereadService } = await import('../src/services/wereadService.js')
 const { AssistantMemory } = await import('../src/services/assistantMemory.js')
 const { executeTool } = await import('../src/services/assistantTools.js')
+const { exportService } = await import('../src/services/exportService.js')
 const { configService } = await import('../src/services/configService.js')
 
 const svc = chatService as any
@@ -371,9 +372,9 @@ const bridge = await import('../src/services/pythonBridge.js')
 
 /** 装上假 runner，返回它收到的调用，便于断言参数 */
 function stubScript(stdout: string, code = 0, stderr = '') {
-  const calls: { script: string; args: string[] }[] = []
-  bridge.setScriptRunner(async (script: string, args: string[]) => {
-    calls.push({ script, args })
+  const calls: { script: string; args: string[]; env?: Record<string, string> }[] = []
+  bridge.setScriptRunner(async (script: string, args: string[], options: any) => {
+    calls.push({ script, args, env: options?.env })
     return { stdout, stderr, code }
   })
   return calls
@@ -464,5 +465,191 @@ test('who_owes_reply：没人欠账时说实话', async () => {
   try {
     assert.match(await run('who_owes_reply', { days: 7 }), /最近 7 天没有明显在等你回话/)
   } finally { bridge.setScriptRunner(null) }
+})
+
+// ------------------------------------------------- 语义检索与导出
+
+test('search_semantic：查询词走环境变量，不进 argv', async () => {
+  // 仓库写进测试的隐私纪律：用户输入继承环境变量而不是进程参数（ps 里看不到正文）
+  const calls = stubScript(JSON.stringify([{ title: '某篇文章', source: 'x.md', score: 0.9, text: '片段' }]))
+  try {
+    await run('search_semantic', { query: '和钱有关的讨论' })
+    assert.equal(calls[0].env?.WEFLOW_SEARCH_QUERY, '和钱有关的讨论', '查询词必须在环境变量里')
+    assert.equal(calls[0].args.includes('和钱有关的讨论'), false, '查询词不许出现在 argv')
+    assert.deepEqual(calls[0].args, ['search', '--top-k', '8'])
+  } finally { bridge.setScriptRunner(null) }
+})
+
+test('search_semantic：结果渲染成标题+分数+片段', async () => {
+  const realGet = configService.get.bind(configService)
+  ;(configService as any).get = (k: string) => (k === 'assistantPrivacy' ? 'balanced' : realGet(k))
+  stubScript(JSON.stringify([
+    { title: '部署方案', source: 'a.md', score: 0.87, text: '先灰度再全量' },
+    { title: '预算讨论', source: 'b.md', score: 0.71, text: '成本核算' },
+  ]))
+  try {
+    const out = await run('search_semantic', { query: '上线' })
+    assert.match(out, /前 2 条/)
+    assert.match(out, /部署方案（0\.87）/)
+    assert.match(out, /先灰度再全量/)
+  } finally {
+    bridge.setScriptRunner(null)
+    ;(configService as any).get = realGet
+  }
+})
+
+test('search_semantic：严格模式下片段被遮罩', async () => {
+  stubScript(JSON.stringify([{ title: 't', score: 0.5, text: '第三方正文内容' }]))
+  try {
+    const out = await run('search_semantic', { query: 'x' })
+    assert.doesNotMatch(out, /第三方正文内容/)
+  } finally { bridge.setScriptRunner(null) }
+})
+
+test('search_semantic：没结果与失败是两句不同的话', async () => {
+  stubScript('[]')
+  try {
+    assert.match(await run('search_semantic', { query: 'x' }), /没有结果/)
+  } finally { bridge.setScriptRunner(null) }
+
+  stubScript('', 3, '缺少 dashscopeApiKey')
+  try {
+    const out = await run('search_semantic', { query: 'x' })
+    assert.match(out, /语义检索失败/)
+    assert.match(out, /search-index/, '失败时要提示可能还没建索引')
+  } finally { bridge.setScriptRunner(null) }
+})
+
+test('export_chat：导出到 output/exports/ 下的新目录，并报出条数', async () => {
+  const exportRoot = join(HOME, 'exports-tmp')
+  mkdirSync(exportRoot, { recursive: true })
+  process.env.WEFLOW_ASSISTANT_EXPORT_ROOT = exportRoot
+
+  const calls: any[] = []
+  const realExport = exportService.exportHtml.bind(exportService)
+  ;(exportService as any).exportHtml = async (talker: string, outDir: string, limit: number) => {
+    calls.push({ talker, outDir, limit })
+    return { success: true, path: outDir, count: 42 }
+  }
+  svc.listSessions = async () => ([{ displayName: '甲', username: 'wxid_a' }])
+  try {
+    const out = await run('export_chat', { contact: '甲', limit: 100 })
+    assert.match(out, /已导出 42 条/)
+    assert.match(out, /output\/exports\/甲-\d{12}/, '路径固定、带时间戳')
+    assert.equal(calls[0].talker, 'wxid_a', '显示名要先解析成会话 id')
+    assert.equal(calls[0].limit, 100)
+    const normalized = calls[0].outDir.split(String.fromCharCode(92)).join('/')
+    assert.match(normalized, /(^|\/)甲-\d{12}(-\d+)?$/, '目录是导出根下的新目录（不依赖根目录名）')
+  } finally {
+    ;(exportService as any).exportHtml = realExport
+  }
+})
+
+test('export_chat：目录已存在时往后加序号，绝不覆盖', async () => {
+  const exportRoot = join(HOME, 'exports-tmp')
+  mkdirSync(exportRoot, { recursive: true })
+  process.env.WEFLOW_ASSISTANT_EXPORT_ROOT = exportRoot
+
+  const dirs: string[] = []
+  const realExport = exportService.exportHtml.bind(exportService)
+  ;(exportService as any).exportHtml = async (_t: string, outDir: string) => {
+    dirs.push(outDir)
+    // 模拟"这一秒里已经导过一次"：把目录真实建出来，逼下一次换名字
+    mkdirSync(outDir, { recursive: true })
+    return { success: true, path: outDir, count: 1 }
+  }
+  svc.listSessions = async () => ([{ displayName: '甲', username: 'wxid_a' }])
+  try {
+    await run('export_chat', { contact: '甲' })
+    await run('export_chat', { contact: '甲' })
+    assert.notEqual(dirs[0], dirs[1], '同一秒内两次导出必须落进不同目录')
+    assert.match(dirs[1], /-2$/, '撞了就加序号')
+  } finally {
+    ;(exportService as any).exportHtml = realExport
+  }
+})
+
+test('export_chat：导出失败时如实说，且不带出奇怪的东西', async () => {
+  const realExport = exportService.exportHtml.bind(exportService)
+  ;(exportService as any).exportHtml = async () => ({ success: false, error: '缺少 NT 密钥' })
+  svc.listSessions = async () => ([{ displayName: '甲', username: 'wxid_a' }])
+  try {
+    assert.match(await run('export_chat', { contact: '甲' }), /导出失败: 缺少 NT 密钥/)
+  } finally {
+    ;(exportService as any).exportHtml = realExport
+  }
+})
+
+test('export_chat：缺联系人时不写任何文件', async () => {
+  assert.equal(await run('export_chat', {}), '(缺少 contact 参数)')
+})
+
+// ------------------------------------------------- 给已有工具补的参数
+
+test('get_sns users：谁常发朋友圈（本地聚合，不加新出境）', async () => {
+  svc.getSnsTimeline = async () => ({
+    success: true,
+    timeline: [
+      { create_time: 1758000000, nickname: '甲', content: 'a' },
+      { create_time: 1758000060, nickname: '甲', content: 'b' },
+      { create_time: 1758000120, nickname: '乙', content: 'c' },
+    ],
+  })
+  const out = await run('get_sns', { mode: 'users' })
+  assert.match(out, /甲：2 条/)
+  assert.match(out, /乙：1 条/)
+  assert.ok(out.indexOf('甲') < out.indexOf('乙'), '发得多的排前面')
+})
+
+test('export_chat：格式白名单，认不出来就报参数错误（不猜）', async () => {
+  svc.listSessions = async () => ([{ displayName: '甲', username: 'wxid_a' }])
+  const out = await run('export_chat', { contact: '甲', format: 'pdf' })
+  assert.match(out, /参数错误: format 只能是 html\/txt\/json\/excel/)
+})
+
+test('export_chat：txt 走 txt 那条导出，并在回话里说明格式', async () => {
+  const used: string[] = []
+  const realTxt = exportService.exportTxt.bind(exportService)
+  const realHtml = exportService.exportHtml.bind(exportService)
+  ;(exportService as any).exportTxt = async (_t: string, outDir: string) => {
+    used.push('txt')
+    mkdirSync(outDir, { recursive: true })
+    return { success: true, path: outDir, count: 7 }
+  }
+  ;(exportService as any).exportHtml = async (_t: string, outDir: string) => {
+    used.push('html')
+    return { success: true, path: outDir, count: 7 }
+  }
+  const exportRoot = join(HOME, 'exports-tmp2')
+  mkdirSync(exportRoot, { recursive: true })
+  process.env.WEFLOW_ASSISTANT_EXPORT_ROOT = exportRoot
+  svc.listSessions = async () => ([{ displayName: '甲', username: 'wxid_a' }])
+  try {
+    const out = await run('export_chat', { contact: '甲', format: 'txt' })
+    assert.deepEqual(used, ['txt'], '选了 txt 就不该走 html')
+    assert.match(out, /已导出 7 条/)
+    assert.match(out, /（txt）/, '回话里要说清导的是什么格式')
+  } finally {
+    ;(exportService as any).exportTxt = realTxt
+    ;(exportService as any).exportHtml = realHtml
+  }
+})
+
+test('search_favorites：不给关键词就列最近的收藏', async () => {
+  const asked: any[] = []
+  svc.getFavorites = async (opts: any) => {
+    asked.push(opts)
+    return { success: true, total: 12, favorites: [{ title: '最近的收藏', source_name: '某号' }] }
+  }
+  const out = await run('search_favorites', {})
+  assert.match(out, /最近的收藏/)
+  assert.equal(asked[0].keyword, undefined, '空关键词不该往下传')
+  assert.ok(asked[0].limit >= 15, '列最近时给的条数比搜索时多')
+})
+
+test('search_favorites：收藏为空与搜不到是两句不同的话', async () => {
+  svc.getFavorites = async () => ({ success: true, total: 0, favorites: [] })
+  assert.match(await run('search_favorites', {}), /收藏是空的，或收藏库/)
+  assert.match(await run('search_favorites', { keyword: '不存在' }), /收藏中未搜到「不存在」/)
 })
 
