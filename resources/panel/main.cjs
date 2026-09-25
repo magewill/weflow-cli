@@ -380,22 +380,34 @@ if (!app.requestSingleInstanceLock()) {
     let dragOrigin = null
     ipcMain.handle('panel:dragStart', (_event, point) => {
       if (!win || win.isDestroyed()) return null
-      const { x: wx, y: wy } = win.getContentBounds()
-      dragOrigin = { pointerX: point.x, pointerY: point.y, winX: wx, winY: wy }
-      return { x: wx, y: wy }
+      const from = win.getContentBounds()
+      // **尺寸也在这里记一次**（不只是位置）。理由见 dragMove 那段注释：
+      // 每次移动去读"当前尺寸"会在**可缩放**的窗口上让尺寸跟着位移一起长。
+      dragOrigin = {
+        pointerX: point.x, pointerY: point.y, winX: from.x, winY: from.y,
+        width: from.width, height: from.height,
+      }
+      return { x: from.x, y: from.y }
     })
     ipcMain.handle('panel:dragMove', (_event, point) => {
       if (!win || win.isDestroyed() || !dragOrigin) return null
-      // **用 setBounds 而不是 setPosition**：实测这个窗口（无边框 + 透明 + resizable:false）上
+      // **用 setContentBounds 而不是 setPosition**：实测这个窗口（无边框 + 透明）上
       // `setPosition` 会**把窗口一点点撑大**——每次调用宽 +2 左右，连续拖 8 次之后
       // 76x76 变成 108x84（隔离验证：完全不碰鼠标、只调这两个 IPC 也能复现）。
-      // 显式把当前尺寸一起传进去就不会。
-      const bounds = win.getContentBounds()
+      // 显式把尺寸一起传进去就不会。
+      //
+      // **尺寸必须在 dragStart 记一次、之后一直用它，不能在每次移动时读"当前尺寸"。**
+      // 那是个读-改-写的坑，只有在窗口**可缩放**时才露出来：实测同一个拖动（30 步、位移
+      // 30x24）在 `resizable: false` 下尺寸纹丝不动，在 `resizable: true`（对话形态就是）下
+      // **尺寸漂了 30x24——正好等于这次位移**。于是"在对话形态下拖球"会让窗口每拖一次大一圈，
+      // 而窗口比"气泡 + 间距 + 球"宽出来的部分，全都变成气泡与球之间的那段空档：
+      // 用户的原话是"挪动悬浮气泡时气泡和窗口之间的间距越来越远"（重新展开/收起会精确设回
+      // 尺寸，所以他看到"点一下又复位了"）。
       win.setContentBounds({
         x: Math.round(dragOrigin.winX + point.x - dragOrigin.pointerX),
         y: Math.round(dragOrigin.winY + point.y - dragOrigin.pointerY),
-        width: bounds.width,
-        height: bounds.height,
+        width: dragOrigin.width,
+        height: dragOrigin.height,
       })
       return null
     })

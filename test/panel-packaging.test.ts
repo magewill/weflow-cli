@@ -153,6 +153,24 @@ test('展开之后窗口要自己走到前面来 —— 它不置顶，靠这个
   assert.match(chatBranch, /win\.show\(\)/, '顺手保证它真的可见（hide 过之后 show 是必须的）')
 })
 
+test('拖动时尺寸只在开始时记一次 —— 每次读"当前尺寸"会让可缩放的窗口越拖越大', () => {
+  // 这条是**量出来的**：同一个拖动（30 步、位移 30x24）在 `resizable: false` 下尺寸纹丝不动，
+  // 在 `resizable: true`（对话形态就是）下**尺寸漂了 30x24——正好等于这次位移**。
+  // 于是"在对话形态下拖球"会让窗口每拖一次大一圈，而窗口比"气泡 + 间距 + 球"宽出来的部分
+  // 全变成气泡与球之间的空档（用户："挪动悬浮气泡时气泡和窗口之间的间距越来越远"）。
+  const main = code('main.cjs')
+  const move = main.slice(main.indexOf("ipcMain.handle('panel:dragMove'"),
+                          main.indexOf("ipcMain.handle('panel:dragEnd'"))
+  assert.ok(move.length > 0, '应当能找到 dragMove')
+  assert.doesNotMatch(move, /getContentBounds\(\)/, '移动时不许再读"当前尺寸"——那是读-改-写')
+  assert.match(move, /width: dragOrigin\.width/, '尺寸要用开始时记下的那个')
+  assert.match(move, /height: dragOrigin\.height/)
+  const start = main.slice(main.indexOf("ipcMain.handle('panel:dragStart'"),
+                           main.indexOf("ipcMain.handle('panel:dragMove'"))
+  assert.match(start, /width: from\.width/, 'dragStart 要把尺寸一起记下来')
+  assert.match(start, /height: from\.height/)
+})
+
 test('ready-to-show 的监听要挂在 loadURL 之前 —— 它不会重放', () => {
   // 第二个真 bug 的回归测试：第一版在 `await loadURL` 之后才挂 `ready-to-show`，
   // 而那个事件在加载过程中就可能已经触发过、且不会重放，于是窗口永远不显示

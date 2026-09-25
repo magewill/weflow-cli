@@ -337,6 +337,19 @@ All notable user-facing changes are recorded here. This project follows [Semanti
   the answer went"), and the conversation shows a readable turn (`快速回复：<name>`) while what is actually sent is the
   explicit tool-naming request, so the chat log does not fill up with machine-shaped instructions.
 
+### Fixed
+
+- **Dragging the ball in the chat window grew the window by the drag distance, and the extra width showed up as
+  a gap between the ball and the bubble.** `panel:dragMove` re-read the window's *current* size with
+  `getContentBounds()` and wrote it straight back with the new position - a read-modify-write, and the read is
+  the one that lags. Measured with a probe driving the same IPC sequence (30 steps, a 30x24 move) on a window
+  with the panel's own options: with `resizable: false` the size does not move at all, and with
+  `resizable: true` (which is what the chat window is) it drifts by **exactly the drag delta, 30x24**. The size
+  is now captured once in `dragStart` and reused for every move, which measures 0x0 in both cases. The symptom
+  matched: the bubble is pinned to the window's left and the ball to its right, so any width beyond
+  "bubble + gap + ball" appears between them - and expanding or collapsing re-asserts the exact size, which is
+  why clicking the ball "reset" it. A test pins that `dragMove` never calls `getContentBounds()`.
+
 ### Changed
 
 - **The MCP surface now says what it actually is, and `draft_reply` on that surface needs an explicit
@@ -422,7 +435,9 @@ All notable user-facing changes are recorded here. This project follows [Semanti
   transparent, non-resizable) operate on the **outer** rect and drift a little on every call - measured at
   roughly +0.8px per call, with no bound: 20 moves took 76x76 to 97x92, and the same happens without any
   mouse involved (calling the drag IPC directly reproduces it). `setContentBounds` (the client area) is
-  stable - 20 moves, size unchanged. The same drift was quietly affecting `setMode` too: expanding measured
+  stable - 20 moves, size unchanged. **That measurement was narrower than the sentence:** it was taken on the
+  non-resizable ball window, and the claim does not survive on a *resizable* one if the size is re-read from
+  `getContentBounds()` on every move - see the drag fix below. The same drift was quietly affecting `setMode` too: expanding measured
   421x561 rather than the requested 420x560.
 
  Every "atomic write" in this project (the memory file,
