@@ -18,6 +18,7 @@ const { spawn } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
 const os = require('node:os')
 const { trayMenuTemplate } = require('./tray-menu.cjs')
+const { quickMenuTemplate } = require('./quick-menu.cjs')
 
 const ENDPOINT_FILE = join(os.homedir(), '.weflow-cli', 'assistant_endpoint.json')
 const POSITION_FILE = join(os.homedir(), '.weflow-cli', 'panel_position.json')
@@ -280,6 +281,12 @@ function setMode(mode, opts) {
     win.setSkipTaskbar(false)
     win.setContentBounds(layout.window)
     win.setResizable(true)        // 展开后可调大小
+    // **展开之后要自己走到前面来。** 对话形态按设计不置顶，而"谁在最前面"此前完全靠运气：
+    // 右键那条路尤其明显——球是置顶的、看得见，可原生菜单一关，Windows 可能把焦点还给了
+    // 别的窗口，于是候选出在一个被压在后面的窗口里，用户的原话是"不知道消息返回到哪里了"。
+    if (!win.isVisible()) win.show()
+    win.moveTop()                 // 先抬到 z 序顶（这一步不依赖前台锁）
+    win.focus()                   // 再夺焦点：Windows 偶尔会拒绝它，所以上面那步不能省
     ballMode = false
     win.webContents.send('panel:mode', {
       mode: 'chat', side: layout.side, anchorY: layout.anchorY, bubbleHeight: layout.bubbleHeight,
@@ -357,6 +364,16 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     ipcMain.handle('panel:setMode', (_event, mode, opts) => setMode(mode, opts))
+
+    // 右键"快速回复"。**用原生菜单**：它画在窗口外面，所以球那 76x76 的窗口不用先展开
+    // （页内菜单做不到这一点——它会被窗口裁掉）。选中回一个名字，关掉没选回 null。
+    ipcMain.handle('panel:quickMenu', (_event, labels) => new Promise((resolve) => {
+      if (!win) { resolve(null); return }
+      let picked = null
+      // 先记下来、关菜单时再 resolve：`click` 与 `popup` 的 callback 谁先到不该决定结果
+      const menu = Menu.buildFromTemplate(quickMenuTemplate(labels, { pick: (name) => { picked = name } }))
+      menu.popup({ window: win, callback: () => resolve(picked) })
+    }))
 
     // 拖拽：按下时记下"窗口位置 + 指针位置"，移动时按差值挪窗口。
     // 用差值而不是绝对值，是为了不受 DPI 缩放与多屏坐标原点的影响。
